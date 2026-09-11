@@ -377,7 +377,6 @@
               <option value="Xenova/whisper-small" selected>small — 정확 · 약 250MB (권장)</option>
               <option value="Xenova/whisper-base">base — 중간 · 약 80MB</option>
               <option value="Xenova/whisper-tiny">tiny — 가장 빠름 · 약 40MB · 오탈자 많음</option>
-              <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo — 가장 정확 · 약 1.5GB · WebGPU 필요 (실험적)</option>
             </select>
             <span class="ctl-hint" id="modelHint">처음 한 번만 내려받아 브라우저에 저장됩니다. 한국어는 클수록 확실히 정확합니다.</span>
           </label>
@@ -1007,32 +1006,8 @@
      finish must surface as a message, never as a hang.                        */
   var TRANSFORMERS_URL = "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2";
   var TRANSFORMERS_UMD = "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js";
-  // large-v3-turbo needs WebGPU, which the older library (above) cannot drive —
-  // that requires transformers.js v3, loaded only when this model is picked so
-  // the proven small/base/tiny path never depends on it.
-  var TRANSFORMERS_URL_V3 = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.web.min.js";
-  var LARGE_TURBO_MODEL = "onnx-community/whisper-large-v3-turbo";
-  function isV3Model(model) { return model === LARGE_TURBO_MODEL; }
   var MODEL_STALL_MS = 90000;   // no download progress at all for this long
   var SEG_TIMEOUT_MS = 180000;  // one segment taking longer than this
-
-  // Which library + pipeline options a model needs. v3's browser build is
-  // ESM-only (no importScripts global), so it only ever runs through the
-  // module-worker strategy. fp16 needs a GPU feature not every WebGPU adapter
-  // has; forceFp32 is used to retry once at a (larger) precision every adapter
-  // supports, rather than failing outright.
-  function engineFor(model, forceFp32) {
-    if (isV3Model(model)) {
-      return {
-        url: TRANSFORMERS_URL_V3,
-        pipelineOpts: {
-          device: "webgpu",
-          dtype: { encoder_model: forceFp32 ? "fp32" : "fp16", decoder_model_merged: "q4" }
-        }
-      };
-    }
-    return { url: TRANSFORMERS_URL, pipelineOpts: { quantized: true } };
-  }
 
   // Strategy 2: a classic worker + importScripts, for a browser that cannot run
   // a module worker. Still a worker, so it can never block the UI — the worst
@@ -1047,9 +1022,10 @@
     '    if (!t || !t.pipeline) throw new Error("umd-global-missing");',
     '    if (m.type === "init") {',
     '      try { t.env.allowLocalModels = false; t.env.backends.onnx.wasm.numThreads = 1; } catch (ig) {}',
-    '      var popts = Object.assign({}, m.pipelineOpts || { quantized: true });',
-    '      popts.progress_callback = function (p) { self.postMessage({ type: "progress", p: p }); };',
-    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, popts);',
+    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, {',
+    '        quantized: true,',
+    '        progress_callback: function (p) { self.postMessage({ type: "progress", p: p }); }',
+    '      });',
     '      self.postMessage({ type: "ready" });',
     '    } else if (m.type === "run") {',
     '      var r = await pipe(m.audio, m.opts);',
@@ -1075,9 +1051,10 @@
     // multi-threaded WASM init can stall; pin to 1 thread for deterministic behaviour
     '        t.env.backends.onnx.wasm.numThreads = 1;',
     '      } catch (ignored) {}',
-    '      const popts = Object.assign({}, m.pipelineOpts || { quantized: true });',
-    '      popts.progress_callback = (p) => self.postMessage({ type: "progress", p: p });',
-    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, popts);',
+    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, {',
+    '        quantized: true,',
+    '        progress_callback: (p) => self.postMessage({ type: "progress", p: p })',
+    '      });',
     '      self.postMessage({ type: "ready" });',
     '    } else if (m.type === "run") {',
     '      const r = await pipe(m.audio, m.opts);',
@@ -1141,17 +1118,6 @@
       // A cancel is a decision, and a stall means the CDN is unreachable — retrying
       // would just make the person wait out the same timeout twice.
       if (why === "cancelled" || why === "stalled") throw e;
-      if (isV3Model(model)) {
-        // v3's browser build is ESM-only, so a classic (importScripts) worker
-        // can never load it — retrying one would just fail again, confusingly.
-        // The one thing worth retrying is fp16, which not every WebGPU adapter
-        // supports; fall back once to fp32 (a bigger download) instead.
-        if (/fp16/i.test(why)) {
-          asr.initing = null;
-          return startWorker(model, true, true);
-        }
-        throw e;
-      }
       asr.initing = null;
       return startWorker(model, false);
     });
@@ -1159,7 +1125,7 @@
     return asr.initing;
   }
 
-  function startWorker(model, asModule, forceFp32) {
+  function startWorker(model, asModule) {
     return new Promise(function (resolve, reject) {
       var w, url;
       try {
@@ -1188,8 +1154,7 @@
       asr.onInitEnd = finish;
       w.onmessage = asrDispatch;
       w.onerror = function () { finish(new Error("worker-error")); };
-      var eng = engineFor(model, forceFp32);
-      w.postMessage({ type: "init", url: eng.url, model: model, pipelineOpts: eng.pipelineOpts });
+      w.postMessage({ type: "init", url: TRANSFORMERS_URL, model: model });
     });
   }
 
@@ -1255,37 +1220,24 @@
   var MAX_ASR_SECONDS = 1800;
 
   // rough relative cost per second of audio, used only to size timeouts and to
-  // tell the person roughly how long to expect to wait. large-v3-turbo runs on
-  // the GPU rather than CPU WASM, so it isn't comparable to the others — its
-  // number here only sizes the timeout leash generously, not a real estimate.
+  // tell the person roughly how long to expect to wait
   function modelWeight(model) {
-    if (isV3Model(model)) return 3;
     if (/small/.test(model)) return 5;
     if (/base/.test(model)) return 2;
     return 1;
   }
-
-  // Detected once at page load (see the WebGPU check below); read here so the
-  // hint can say plainly whether large-v3-turbo will actually run.
-  var WEBGPU_OK = false;
 
   // GitHub Pages cannot send the COOP/COEP headers that multi-threaded WASM
   // needs, so recognition runs single-threaded no matter the machine. Say so up
   // front rather than letting a slow run look broken.
   function describeModelCost() {
     var model = ($("model") && $("model").value) || "";
-    var hint = $("modelHint");
-    if (!hint) return;
-    if (isV3Model(model)) {
-      hint.textContent = "large-v3-turbo · 약 1.5GB (처음 한 번만 내려받아 브라우저에 저장, 기기에 따라 다름) · " +
-        "GPU에서 실행되어 속도는 예측하기 어렵습니다 · 정확도는 가장 높지만 이 페이지에서 실제로 오래 검증된 조합은 아닙니다. " +
-        (WEBGPU_OK ? "이 브라우저에서 WebGPU 사용 가능 — 선택할 수 있습니다." : "이 브라우저·기기는 WebGPU를 지원하지 않아 실행되지 않습니다.");
-      return;
-    }
     var w = modelWeight(model);
     var name = /small/.test(model) ? "small" : /base/.test(model) ? "base" : "tiny";
     var size = /small/.test(model) ? "약 250MB" : /base/.test(model) ? "약 80MB" : "약 40MB";
     var per = (w * 1.5).toFixed(0);
+    var hint = $("modelHint");
+    if (!hint) return;
     hint.textContent = name + " · " + size + " (처음 한 번만 내려받아 브라우저에 저장) · " +
       "오디오 10초당 대략 " + per + "~" + (w * 4) + "초 소요. " +
       (w >= 5 ? "정확도가 가장 높지만 가장 오래 걸립니다. " : "") +
@@ -1313,18 +1265,6 @@
       throw new Error("too-long:" + Math.round(resultDur()));
     }
     var model = ($("model") && $("model").value) || "Xenova/whisper-small";
-    // large-v3-turbo cannot run at all without WebGPU — fail before ever
-    // starting a worker or downloading anything, with a clear reason. The API
-    // existing is not enough to check: a browser can expose navigator.gpu yet
-    // still have no usable adapter (blocklisted GPU, disabled flag), so this
-    // actually asks for one rather than just feature-detecting the property.
-    if (isV3Model(model)) {
-      var adapter = null;
-      if (navigator.gpu && navigator.gpu.requestAdapter) {
-        try { adapter = await navigator.gpu.requestAdapter(); } catch (ignored) { adapter = null; }
-      }
-      if (!adapter) throw new Error("no-webgpu");
-    }
     var report = asrProgressReporter(onStatus);
 
     asr.cancelled = false;
@@ -1629,7 +1569,6 @@
     if (m.indexOf("too-long:") === 0) return "결과 길이가 " + Math.round(m.split(":")[1] / 60) + "분으로 너무 깁니다 (자막은 " + (MAX_ASR_SECONDS / 60) + "분까지만 지원합니다)";
     if (m === "no-speech") return "인식된 음성이 없습니다 (무음이거나 목소리가 너무 작을 수 있습니다)";
     if (m === "file-protocol") return "HTML 파일을 직접 열면(file://) 인식 모델을 불러올 수 없습니다 — 웹서버로 올려서 열어 주세요";
-    if (m === "no-webgpu") return "이 브라우저·기기는 WebGPU를 지원하지 않아 large-v3-turbo 모델을 쓸 수 없습니다 (small 이하 모델을 선택해 주세요)";
     return "브라우저가 음성 인식을 실행하지 못했습니다 (" + (m || "원인 불명") + ")";
   }
 
@@ -1861,22 +1800,19 @@
   $("model").addEventListener("change", describeModelCost);
   describeModelCost();
 
-  // Detect WebGPU once at load — large-v3-turbo below reads WEBGPU_OK to
-  // explain up front whether it can actually run here, instead of letting the
-  // person pick it and find out only after a failed download.
+  // Report whether this machine could run a GPU-accelerated model at all. The
+  // page does not use WebGPU yet (that needs a newer transformers.js), so this
+  // is purely so we know whether that upgrade is worth doing on this machine.
   (function () {
-    if (!navigator.gpu || !navigator.gpu.requestAdapter) { describeModelCost(); return; }
+    if (!navigator.gpu || !navigator.gpu.requestAdapter) return;
     navigator.gpu.requestAdapter().then(function (a) {
+      if (!a) return;
       var el = $("gpuNote");
-      if (a) {
-        WEBGPU_OK = true;
-        if (el) {
-          el.hidden = false;
-          el.textContent = "이 브라우저는 WebGPU를 지원합니다 — 인식 모델에서 large-v3-turbo를 선택할 수 있습니다.";
-        }
+      if (el) {
+        el.hidden = false;
+        el.textContent = "이 브라우저는 WebGPU를 지원합니다 — 더 큰 모델(large-v3-turbo)을 쓸 수 있는 환경입니다.";
       }
-      describeModelCost();
-    })["catch"](function () { describeModelCost(); });
+    })["catch"](function () {});
   })();
 
   $("cancel").addEventListener("click", function () {
